@@ -36,6 +36,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -73,7 +74,7 @@ public class Client {
     private Integer reconnectInterval;
     private Integer pingInterval;
     private volatile CompletableFuture<Void> readyFuture;
-    private volatile boolean pingLoopRunning;
+    private CountDownLatch pingStopSignal;
     private volatile boolean hasEverConnected;
 
 
@@ -101,7 +102,6 @@ public class Client {
         this.readyFuture = new CompletableFuture<>();
         this.onReconnecting = builder.onReconnecting;
         this.onReconnected = builder.onReconnected;
-        this.pingLoopRunning = false;
         this.hasEverConnected = false;
     }
 
@@ -164,6 +164,12 @@ public class Client {
      */
     public void close() {
         this.userClosed = true;
+        synchronized (this) {
+            if (this.pingStopSignal != null) {
+                this.pingStopSignal.countDown();
+                this.pingStopSignal = null;
+            }
+        }
         if (!this.readyFuture.isDone()) {
             this.readyFuture.completeExceptionally(new ServerUnreachableException("websocket client closed"));
         }
@@ -215,17 +221,27 @@ public class Client {
     }
 
     private synchronized void startPingLoop() {
-        if (this.pingLoopRunning) {
+        if (this.userClosed || this.pingStopSignal != null) {
             return;
         }
-        this.pingLoopRunning = true;
-        this.executor.execute(this::pingLoop);
+        // Each generation owns its stop signal: restarting cannot revive an old loop.
+        CountDownLatch stopSignal = new CountDownLatch(1);
+        this.pingStopSignal = stopSignal;
+        try {
+            this.executor.execute(() -> pingLoop(stopSignal));
+        } catch (RuntimeException e) {
+            this.pingStopSignal = null;
+            stopSignal.countDown();
+            throw e;
+        }
     }
 
-    private void pingLoop() {
+    private void pingLoop(CountDownLatch stopSignal) {
         try {
-            this.sleep(2000);
-            while (!this.userClosed) {
+            if (stopSignal.await(2000, TimeUnit.MILLISECONDS)) {
+                return;
+            }
+            while (stopSignal.getCount() != 0) {
                 try {
                     if (this.conn != null) {
                         Pbbp2.Frame frame = newPingFrame(Integer.parseInt(this.serviceId));
@@ -234,12 +250,19 @@ public class Client {
                     }
                 } catch (Throwable t) {
                     log.warn(fmtLog("ping failed"), t);
-                } finally {
-                    this.sleep(this.pingInterval * 1000);
+                }
+                if (stopSignal.await(this.pingInterval * 1000L, TimeUnit.MILLISECONDS)) {
+                    return;
                 }
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         } finally {
-            this.pingLoopRunning = false;
+            synchronized (this) {
+                if (this.pingStopSignal == stopSignal) {
+                    this.pingStopSignal = null;
+                }
+            }
         }
     }
 

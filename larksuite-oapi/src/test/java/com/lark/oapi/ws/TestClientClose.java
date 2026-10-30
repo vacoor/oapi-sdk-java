@@ -7,6 +7,82 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.Assert.*;
 
 public class TestClientClose {
+    private void startHeartbeat(Client client) throws Exception {
+        java.lang.reflect.Method method = Client.class.getDeclaredMethod("startPingLoop");
+        method.setAccessible(true);
+        method.invoke(client);
+    }
+
+    private CountDownLatch stopSignal(Client client) throws Exception {
+        java.lang.reflect.Field field = Client.class.getDeclaredField("pingStopSignal");
+        field.setAccessible(true);
+        return (CountDownLatch) field.get(client);
+    }
+
+    @Test(timeout = 8000)
+    public void closeWakesHeartbeatDuringLongInterval() throws Exception {
+        Client client = client();
+        try {
+            startHeartbeat(client);
+            // Let the initial two-second delay elapse and enter the 120-second interval.
+            Thread.sleep(2200);
+            client.close();
+            client.executor.shutdown();
+            assertTrue("Heartbeat should wake without interrupting the executor",
+                    client.executor.awaitTermination(1, TimeUnit.SECONDS));
+        } finally {
+            client.executor.shutdownNow();
+        }
+    }
+
+    @Test(timeout = 5000)
+    public void restartDoesNotReviveOldHeartbeatOrClearNewSignal() throws Exception {
+        Client client = client();
+        try {
+            startHeartbeat(client);
+            CountDownLatch oldSignal = stopSignal(client);
+            client.close();
+            client.userClosed = false; // Exercise heartbeat restart without network access.
+            startHeartbeat(client);
+            CountDownLatch newSignal = stopSignal(client);
+            assertNotSame(oldSignal, newSignal);
+            assertEquals(0, oldSignal.getCount());
+            assertEquals(1, newSignal.getCount());
+            startHeartbeat(client);
+            assertSame(newSignal, stopSignal(client));
+            client.close(true, 1000);
+            assertEquals(0, newSignal.getCount());
+            assertTrue(client.executor.isTerminated());
+        } finally {
+            client.executor.shutdownNow();
+        }
+    }
+
+    @Test(timeout = 5000)
+    public void stoppingHeartbeatDoesNotInterruptBusinessTask() throws Exception {
+        Client client = client();
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        try {
+            Future<Boolean> business = client.executor.submit(() -> {
+                started.countDown();
+                release.await();
+                return true;
+            });
+            assertTrue(started.await(1, TimeUnit.SECONDS));
+            startHeartbeat(client);
+            client.close();
+            assertFalse(business.isDone());
+            release.countDown();
+            client.close(true, 1000);
+            assertTrue(business.get(1, TimeUnit.SECONDS));
+            assertTrue(client.executor.isTerminated());
+        } finally {
+            release.countDown();
+            client.executor.shutdownNow();
+        }
+    }
+
     private Client client() {
         return new Client.Builder("app_id", "app_secret").autoReconnect(true).build();
     }

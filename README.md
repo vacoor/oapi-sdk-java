@@ -282,3 +282,5 @@ If the calling thread is interrupted, shutdown is forced and its interrupt flag 
 After executor shutdown, `start()` throws `IllegalStateException`; create a new Client to reconnect.
 Invoke the shutdown overloads outside SDK event/worker threads to avoid waiting for the calling task itself.
 Use `close(true)` when disposing of the client or exiting the application. The no-argument behavior remains unchanged for compatibility.
+
+Closing a client also wakes and stops its heartbeat promptly, without interrupting business tasks. Each restart uses a separate heartbeat stop signal so a previous loop cannot resume.
