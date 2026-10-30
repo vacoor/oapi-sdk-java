@@ -46,6 +46,8 @@ import static com.lark.oapi.ws.Constant.*;
 
 public class Client {
     private static final Logger log = LoggerFactory.getLogger(Client.class);
+    private static final long DEFAULT_SHUTDOWN_TIMEOUT_MILLIS = 30000;
+
     protected final ExecutorService executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors() * 2 + 1);
     private final String appId;
     private final String appSecret;
@@ -104,6 +106,9 @@ public class Client {
     }
 
     public void start() {
+        if (this.executor.isShutdown()) {
+            throw new IllegalStateException("websocket client executor has been shutdown");
+        }
         this.userClosed = false;
         if (this.readyFuture.isDone()) {
             this.readyFuture = new CompletableFuture<>();
@@ -154,12 +159,59 @@ public class Client {
         }
     }
 
+    /**
+     * Disconnects without shutting down the executor, preserving the existing restart behavior.
+     */
     public void close() {
         this.userClosed = true;
         if (!this.readyFuture.isDone()) {
             this.readyFuture.completeExceptionally(new ServerUnreachableException("websocket client closed"));
         }
         this.disconnect();
+    }
+
+    /**
+     * Disconnects and optionally shuts down the executor, waiting up to 30 seconds
+     * before interrupting unfinished tasks. A shut-down client cannot be restarted.
+     * Call with {@code shutdown=true} from outside this client's event/worker threads.
+     *
+     * @param shutdown whether to permanently shut down the executor
+     */
+    public void close(boolean shutdown) {
+        close(shutdown, DEFAULT_SHUTDOWN_TIMEOUT_MILLIS);
+    }
+
+    /**
+     * Disconnects and optionally shuts down the executor gracefully. If the wait expires,
+     * unfinished tasks are interrupted; their termination is not guaranteed on return.
+     * Interruption of the caller triggers immediate shutdown and restores its interrupt flag.
+     * A shut-down client cannot be restarted. To avoid waiting for the calling task itself,
+     * call with {@code shutdown=true} from outside this client's event/worker threads.
+     *
+     * @param shutdown whether to permanently shut down the executor; false preserves it
+     * @param timeoutMillis non-negative graceful shutdown wait in milliseconds; ignored
+     *                      when shutdown is false; zero requests immediate forced shutdown
+     * @throws IllegalArgumentException if timeoutMillis is negative
+     */
+    public void close(boolean shutdown, long timeoutMillis) {
+        if (shutdown && timeoutMillis < 0) {
+            throw new IllegalArgumentException("timeoutMillis must not be negative");
+        }
+        try {
+            close();
+        } finally {
+            if (shutdown) {
+                this.executor.shutdown();
+                try {
+                    if (!this.executor.awaitTermination(timeoutMillis, TimeUnit.MILLISECONDS)) {
+                        this.executor.shutdownNow();
+                    }
+                } catch (InterruptedException e) {
+                    this.executor.shutdownNow();
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
     }
 
     private synchronized void startPingLoop() {
